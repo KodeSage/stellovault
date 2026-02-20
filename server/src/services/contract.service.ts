@@ -8,6 +8,7 @@ import {
   Operation,
   Horizon,
   SorobanRpc,
+  Transaction,
 } from "@stellar/stellar-sdk";
 import { env } from "../config/env";
 
@@ -75,7 +76,9 @@ export class ContractService {
     const assembled = SorobanRpc.assembleTransaction(tx, simulated).build();
 
     const feePayerKeypair = Keypair.fromSecret(env.feePayer.secretKey);
-    assembled.sign(feePayerKeypair);
+    (tx as Transaction).sign(feePayerKeypair);
+    // const feePayerKeypair = Keypair.fromSecret(env.feePayer.secretKey);
+    // assembled.sign(feePayerKeypair);
 
     return assembled.toXDR();
   }
