@@ -60,7 +60,7 @@ export class ContractService {
           source: sourcePublicKey,
         }),
       )
-      .setTimeout(30)
+      .setTimeout(300)
       .build();
 
     const simulated = await this.rpcServer.simulateTransaction(tx);
@@ -152,7 +152,9 @@ export class ContractService {
     }
 
     if (getResponse.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-      throw new Error("Transaction failed on-chain");
+      throw new Error(
+        `Transaction failed on-chain: ${getResponse.resultXdr?.toXDR("base64") ?? "no result XDR available"}`,
+      );
     }
 
     return {
