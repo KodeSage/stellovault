@@ -12,23 +12,22 @@ datasource db {
 // ─────────────────────────────────────────────
 
 model User {
-  id             String    @id @default(uuid())
-  stellarAddress String    @unique
-  name           String?
-  role           Role      @default(USER)
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
-  loans          Loan[]    @relation("BorrowerLoans")
-  lentLoans      Loan[]    @relation("LenderLoans")
-  wallets        Wallet[]
-  challenges     WalletChallenge[]
-  boughtEscrows  Escrow[]  @relation("BuyerEscrows")
-  soldEscrows    Escrow[]  @relation("SellerEscrows")
-  investments    Investment[]
-
-  sessions           Session[]
-  borrowedLoans      Loan[]              @relation("BorrowerLoans")
-  governanceProposals GovernanceProposal[] @relation("ProposerProposals")
+  id                  String                @id @default(uuid())
+  stellarAddress      String                @unique
+  name                String?
+  role                Role                  @default(USER)
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+  
+  wallets             Wallet[]
+  challenges          WalletChallenge[]
+  boughtEscrows       Escrow[]              @relation("BuyerEscrows")
+  soldEscrows         Escrow[]              @relation("SellerEscrows")
+  investments         Investment[]
+  sessions            Session[]
+  borrowedLoans       Loan[]                @relation("BorrowerLoans")
+  lentLoans           Loan[]                @relation("LenderLoans")
+  governanceProposals GovernanceProposal[]  @relation("ProposerProposals")
 }
 
 model Wallet {
@@ -82,12 +81,7 @@ model Escrow {
   buyer         User         @relation("BuyerEscrows", fields: [buyerId], references: [id])
   sellerId      String
   seller        User         @relation("SellerEscrows", fields: [sellerId], references: [id])
-<<<<<<< HEAD
-  collaterals   Collateral[]
-  amount        Decimal
-=======
   amount        Decimal      @db.Decimal(20, 7)
->>>>>>> 4ab8eb5 (feat: Re-initialize database schema, add Docker Compose for local development, and enhance setup documentation with a new README and Prisma seed script.)
   assetCode     String       @default("USDC")
   status        EscrowStatus @default(PENDING)
   stellarTxHash String?
@@ -236,6 +230,15 @@ enum Role {
   ADMIN
 }
 
+model RiskScore {
+  id           String   @id @default(uuid())
+  wallet       String
+  score        Int      // 0-1000
+  grade        String   // A | B | C | D | F
+  components   Json     // { transactionHistory, repaymentRecord, collateralCoverage, disputeHistory }
+  computedAt   DateTime @default(now())
+
+  @@index([wallet, computedAt])
 enum ChallengePurpose {
   LOGIN
   LINK_WALLET
@@ -250,25 +253,6 @@ enum EscrowStatus {
 }
 
 enum CollateralStatus {
-<<<<<<< HEAD
-  PENDING
-  DEPOSITED
-}
-
-model Collateral {
-  id           String           @id @default(uuid())
-  escrowId     String
-  escrow       Escrow           @relation(fields: [escrowId], references: [id], onDelete: Cascade)
-  assetCode    String
-  amount       Decimal
-  metadataHash String           @unique
-  status       CollateralStatus @default(PENDING)
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
-
-  @@index([escrowId])
-  @@index([status])
-=======
   LOCKED
   RELEASED
   LIQUIDATED
@@ -286,5 +270,17 @@ enum GovernanceStatus {
   PASSED
   REJECTED
   EXECUTED
->>>>>>> 4ab8eb5 (feat: Re-initialize database schema, add Docker Compose for local development, and enhance setup documentation with a new README and Prisma seed script.)
+}
+
+model GovernanceAuditLog {
+  id          String    @id @default(uuid())
+  eventType   String
+  proposalId  String?
+  voterId     String?
+  details     String?
+  txHash      String?
+  createdAt   DateTime  @default(now())
+
+  @@index([eventType])
+  @@index([createdAt])
 }

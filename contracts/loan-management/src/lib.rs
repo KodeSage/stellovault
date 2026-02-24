@@ -90,6 +90,9 @@ pub struct Loan {
     pub interest_rate: u32, // Basis points (e.g., 500 = 5%)
     pub deadline: u64,
     pub status: LoanStatus,
+    pub principal_repaid: i128,
+    pub interest_repaid: i128,
+    pub last_repayment_ts: u64,
 }
 
 #[contract]
@@ -396,6 +399,9 @@ impl LoanManagement {
             interest_rate,
             deadline,
             status: LoanStatus::Active,
+            principal_repaid: 0,
+            interest_repaid: 0,
+            last_repayment_ts: current_ts,
         };
 
         // Store loan by ID
@@ -434,7 +440,10 @@ impl LoanManagement {
         Ok((loan_id, interest_rate))
     }
 
-    /// Repay an active loan
+    /// Repay an active loan (supports partial repayments)
+    ///
+    /// Payment is applied first to accrued interest, then to principal.
+    /// Loan transitions to Repaid only when the full principal is paid off.
     pub fn repay_loan(env: Env, loan_id: u64, amount: i128) -> Result<(), ContractError> {
         let mut loan: Loan = env
             .storage()
@@ -448,6 +457,10 @@ impl LoanManagement {
             return Err(ContractError::LoanNotActive);
         }
 
+        if amount <= 0 {
+            return Err(ContractError::InsufficientAmount);
+        }
+
         let current_ts = env.ledger().timestamp();
         if current_ts > loan.deadline {
             return Err(ContractError::DeadlinePassed);
@@ -457,8 +470,37 @@ impl LoanManagement {
         let interest = (loan.amount * (loan.interest_rate as i128)) / 10000;
         let total_due = loan.amount + interest;
 
-        if amount < total_due {
-            return Err(ContractError::InsufficientAmount);
+        let interest_accrued = (principal_remaining * (loan.interest_rate as i128) * (elapsed as i128))
+            / ((seconds_per_year as i128) * 10000);
+
+        let interest_outstanding = interest_accrued;
+
+        // Apply payment: interest first, then principal
+        let mut remaining_payment = amount;
+
+        // Pay off interest
+        let interest_payment = if remaining_payment >= interest_outstanding {
+            interest_outstanding
+        } else {
+            remaining_payment
+        };
+        remaining_payment -= interest_payment;
+        loan.interest_repaid += interest_payment;
+
+        // Pay off principal with whatever is left
+        let principal_payment = if remaining_payment >= principal_remaining {
+            principal_remaining
+        } else {
+            remaining_payment
+        };
+        loan.principal_repaid += principal_payment;
+
+        // Update last repayment timestamp
+        loan.last_repayment_ts = current_ts;
+
+        // Check if fully repaid
+        if loan.principal_repaid >= loan.amount {
+            loan.status = LoanStatus::Repaid;
         }
 
         // Calculate protocol fee if treasury is configured
@@ -482,22 +524,47 @@ impl LoanManagement {
         loan.status = LoanStatus::Repaid;
         env.storage().persistent().set(&loan_id, &loan);
 
-        // Update total borrowed (decrease)
-        let total_borrowed: i128 = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("tot_bor"))
-            .unwrap_or(0);
-        let new_borrowed = total_borrowed.saturating_sub(loan.amount);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("tot_bor"), &new_borrowed);
+        // Update total borrowed (decrease by principal paid)
+        if principal_payment > 0 {
+            let total_borrowed: i128 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("tot_bor"))
+                .unwrap_or(0);
+            let new_borrowed = total_borrowed.saturating_sub(principal_payment);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("tot_bor"), &new_borrowed);
+        }
 
         // Emit LoanRepaid event including protocol fee
         env.events()
             .publish((symbol_short!("loan_rep"),), (loan_id, amount, protocol_fee));
 
         Ok(())
+    }
+
+    /// Get total amount currently due on a loan (principal remaining + accrued interest)
+    pub fn get_total_due(env: Env, loan_id: u64) -> Result<i128, ContractError> {
+        let loan: Loan = env
+            .storage()
+            .persistent()
+            .get(&loan_id)
+            .ok_or(ContractError::LoanNotFound)?;
+
+        if loan.status != LoanStatus::Active {
+            return Ok(0);
+        }
+
+        let seconds_per_year: u64 = 31_557_600;
+        let current_ts = env.ledger().timestamp();
+        let elapsed = current_ts - loan.last_repayment_ts;
+        let principal_remaining = loan.amount - loan.principal_repaid;
+
+        let interest_accrued = (principal_remaining * (loan.interest_rate as i128) * (elapsed as i128))
+            / ((seconds_per_year as i128) * 10000);
+
+        Ok(principal_remaining + interest_accrued)
     }
 
     /// Mark a loan as defaulted if the deadline has passed
@@ -648,6 +715,26 @@ mod test {
     use super::*;
     use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Env};
 
+    fn setup_env() -> (Env, LoanManagementClient<'static>, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let lender = Address::generate(&env);
+
+        let contract_id = env.register(LoanManagement, ());
+        let client = LoanManagementClient::new(&env, &contract_id);
+        client.initialize(&admin);
+        client.update_total_liquidity(&100_000);
+
+        // Leak to get 'static lifetime for tests
+        let client = unsafe {
+            core::mem::transmute::<LoanManagementClient<'_>, LoanManagementClient<'static>>(client)
+        };
+        (env, client, admin, borrower, lender)
+    }
+
     #[test]
     fn test_initialize() {
         let env = Env::default();
@@ -669,20 +756,7 @@ mod test {
 
     #[test]
     fn test_issue_loan_success() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-
-        // Set some liquidity for utilization calculation
-        client.update_total_liquidity(&10000);
+        let (_env, client, _admin, borrower, lender) = setup_env();
 
         let escrow_id = 1u64;
         let amount = 1000i128;
@@ -691,7 +765,7 @@ mod test {
         let (loan_id, interest_rate) =
             client.issue_loan(&escrow_id, &borrower, &lender, &amount, &duration);
         assert_eq!(loan_id, 1);
-        assert!(interest_rate > 0); // Dynamic rate should be calculated
+        assert!(interest_rate > 0);
 
         let loan = client.get_loan(&loan_id).unwrap();
         assert_eq!(loan.borrower, borrower);
@@ -699,23 +773,14 @@ mod test {
         assert_eq!(loan.amount, amount);
         assert_eq!(loan.status, LoanStatus::Active);
         assert_eq!(loan.interest_rate, interest_rate);
+        assert_eq!(loan.principal_repaid, 0);
+        assert_eq!(loan.interest_repaid, 0);
     }
 
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #4)")]
     fn test_issue_loan_duplicate_escrow() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
+        let (_env, client, _admin, borrower, lender) = setup_env();
 
         let escrow_id = 1u64;
         client.issue_loan(&escrow_id, &borrower, &lender, &1000, &3600);
@@ -725,51 +790,140 @@ mod test {
     }
 
     #[test]
-    fn test_repay_loan_success() {
-        let env = Env::default();
-        env.mock_all_auths();
+    fn test_repay_loan_full() {
+        let (env, client, _admin, borrower, lender) = setup_env();
 
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
+        let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
 
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
+        // Advance time by 1800 seconds (half an hour)
+        env.ledger().with_mut(|li| {
+            li.timestamp += 1800;
+        });
 
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
-
-        let (loan_id, interest_rate) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
-
-        // Calculate total due based on dynamic rate
-        let interest = (1000 * interest_rate as i128) / 10000;
-        let total_due = 1000 + interest;
-
+        // Get total due and pay it all
+        let total_due = client.get_total_due(&loan_id);
         client.repay_loan(&loan_id, &total_due);
 
         let loan = client.get_loan(&loan_id).unwrap();
         assert_eq!(loan.status, LoanStatus::Repaid);
+        assert_eq!(loan.principal_repaid, 1000);
+    }
+
+    #[test]
+    fn test_partial_repayment_keeps_active() {
+        let (env, client, _admin, borrower, lender) = setup_env();
+
+        let (loan_id, interest_rate) =
+            client.issue_loan(&1, &borrower, &lender, &10000, &31_557_600);
+
+        // Advance 1 year so interest accrues
+        env.ledger().with_mut(|li| {
+            li.timestamp += 31_557_600;
+        });
+
+        // interest after 1 year = 10000 * rate / 10000
+        let expected_interest = (10000i128 * interest_rate as i128) / 10000;
+
+        // Pay amount less than interest - should all go to interest
+        let payment = expected_interest / 2;
+        client.repay_loan(&loan_id, &payment);
+
+        let loan = client.get_loan(&loan_id).unwrap();
+        assert_eq!(loan.status, LoanStatus::Active);
+        assert_eq!(loan.interest_repaid, payment);
+        assert_eq!(loan.principal_repaid, 0);
+    }
+
+    #[test]
+    fn test_multiple_partial_repayments() {
+        let (env, client, _admin, borrower, lender) = setup_env();
+
+        let (loan_id, interest_rate) =
+            client.issue_loan(&1, &borrower, &lender, &10000, &31_557_600);
+
+        // Advance 1 year
+        env.ledger().with_mut(|li| {
+            li.timestamp += 31_557_600;
+        });
+
+        let interest_1yr = (10000i128 * interest_rate as i128) / 10000;
+
+        // First payment: pay all interest + 100 principal
+        let first_payment = interest_1yr + 100;
+        client.repay_loan(&loan_id, &first_payment);
+        let loan = client.get_loan(&loan_id).unwrap();
+        assert_eq!(loan.interest_repaid, interest_1yr);
+        assert_eq!(loan.principal_repaid, 100);
+        assert_eq!(loan.status, LoanStatus::Active);
+
+        // No more time passes (so no new interest accrues)
+        // Second payment: pay remaining principal (9900)
+        client.repay_loan(&loan_id, &9900);
+        let loan = client.get_loan(&loan_id).unwrap();
+        assert_eq!(loan.principal_repaid, 10000);
+        assert_eq!(loan.status, LoanStatus::Repaid);
+    }
+
+    #[test]
+    fn test_get_total_due() {
+        let (env, client, _admin, borrower, lender) = setup_env();
+
+        let (loan_id, interest_rate) =
+            client.issue_loan(&1, &borrower, &lender, &10000, &31_557_600);
+
+        // At issuance (no time elapsed), total due is just principal
+        let total = client.get_total_due(&loan_id);
+        assert_eq!(total, 10000);
+
+        // After 1 year, total due = principal + accrued interest
+        env.ledger().with_mut(|li| {
+            li.timestamp += 31_557_600;
+        });
+
+        let expected_interest = (10000i128 * interest_rate as i128) / 10000;
+        let total = client.get_total_due(&loan_id);
+        assert_eq!(total, 10000 + expected_interest);
+    }
+
+    #[test]
+    fn test_get_total_due_after_partial_repayment() {
+        let (env, client, _admin, borrower, lender) = setup_env();
+
+        let (loan_id, interest_rate) =
+            client.issue_loan(&1, &borrower, &lender, &10000, &(31_557_600 * 2));
+
+        // After 1 year: interest accrues
+        env.ledger().with_mut(|li| {
+            li.timestamp += 31_557_600;
+        });
+
+        let interest_1yr = (10000i128 * interest_rate as i128) / 10000;
+
+        // Pay interest + 2000 principal
+        let payment = interest_1yr + 2000;
+        client.repay_loan(&loan_id, &payment);
+
+        // Immediately after payment, total due = 8000 (remaining principal, no new interest)
+        let total = client.get_total_due(&loan_id);
+        assert_eq!(total, 8000);
+
+        // After another year: interest on 8000
+        env.ledger().with_mut(|li| {
+            li.timestamp += 31_557_600;
+        });
+
+        let interest_on_8000 = (8000i128 * interest_rate as i128) / 10000;
+        let total = client.get_total_due(&loan_id);
+        assert_eq!(total, 8000 + interest_on_8000);
     }
 
     #[test]
     fn test_mark_default_success() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
+        let (env, client, _admin, borrower, lender) = setup_env();
 
         let duration = 3600u64;
         let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &duration);
 
-        // Advance ledger time
         env.ledger().with_mut(|li| {
             li.timestamp += duration + 1;
         });
@@ -783,18 +937,7 @@ mod test {
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #6)")]
     fn test_mark_default_too_early() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
+        let (_env, client, _admin, borrower, lender) = setup_env();
 
         let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
 
@@ -803,111 +946,50 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "HostError: Error(Contract, #8)")]
-    fn test_repay_loan_insufficient_amount() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
-
-        let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
-
-        // Provide insufficient amount
-        client.repay_loan(&loan_id, &1000);
-    }
-
-    #[test]
     #[should_panic(expected = "HostError: Error(Contract, #7)")]
     fn test_repay_loan_after_deadline() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
+        let (env, client, _admin, borrower, lender) = setup_env();
 
         let duration = 3600u64;
-        let (loan_id, interest_rate) = client.issue_loan(&1, &borrower, &lender, &1000, &duration);
+        let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &duration);
 
-        // Advance ledger time past deadline
         env.ledger().with_mut(|li| {
             li.timestamp += duration + 1;
         });
 
-        let interest = (1000 * interest_rate as i128) / 10000;
-        let total_due = 1000 + interest;
-        client.repay_loan(&loan_id, &total_due);
+        client.repay_loan(&loan_id, &1050);
     }
 
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #5)")]
     fn test_repay_loan_already_repaid() {
-        let env = Env::default();
-        env.mock_all_auths();
+        let (_env, client, _admin, borrower, lender) = setup_env();
 
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
+        let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
 
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
-
-        let (loan_id, interest_rate) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
-
-        let interest = (1000 * interest_rate as i128) / 10000;
-        let total_due = 1000 + interest;
-        client.repay_loan(&loan_id, &total_due);
+        // No time elapsed, so no interest. Pay full principal.
+        client.repay_loan(&loan_id, &1000);
 
         // Try to repay again
-        client.repay_loan(&loan_id, &total_due);
+        client.repay_loan(&loan_id, &1000);
     }
 
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #5)")]
     fn test_mark_default_already_repaid() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
+        let (env, client, _admin, borrower, lender) = setup_env();
 
         let duration = 3600u64;
-        let (loan_id, interest_rate) = client.issue_loan(&1, &borrower, &lender, &1000, &duration);
+        let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &duration);
 
-        let interest = (1000 * interest_rate as i128) / 10000;
-        let total_due = 1000 + interest;
-        client.repay_loan(&loan_id, &total_due);
+        // No time elapsed, pay full principal
+        client.repay_loan(&loan_id, &1000);
 
-        // Advance ledger time past deadline
         env.ledger().with_mut(|li| {
             li.timestamp += duration + 1;
         });
 
-        // Should fail because status is already Repaid, not Active
+        // Should fail because status is already Repaid
         client.mark_default(&loan_id);
     }
 
@@ -945,16 +1027,9 @@ mod test {
 
     #[test]
     fn test_set_risk_engine() {
-        let env = Env::default();
-        env.mock_all_auths();
+        let (env, client, _admin, _borrower, _lender) = setup_env();
 
-        let admin = Address::generate(&env);
         let risk_engine = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
         client.set_risk_engine(&risk_engine);
 
         let stored_engine = client.get_risk_engine();
@@ -963,24 +1038,14 @@ mod test {
 
     #[test]
     fn test_mark_liquidated_success() {
-        let env = Env::default();
-        env.mock_all_auths();
+        let (env, client, _admin, borrower, lender) = setup_env();
 
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
         let risk_engine = Address::generate(&env);
         let liquidator = Address::generate(&env);
 
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
         client.set_risk_engine(&risk_engine);
-        client.update_total_liquidity(&10000);
 
         let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
-
         client.mark_liquidated(&loan_id, &liquidator);
 
         let loan = client.get_loan(&loan_id).unwrap();
@@ -990,19 +1055,9 @@ mod test {
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #1)")]
     fn test_mark_liquidated_no_risk_engine() {
-        let env = Env::default();
-        env.mock_all_auths();
+        let (env, client, _admin, borrower, lender) = setup_env();
 
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
         let liquidator = Address::generate(&env);
-
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        client.update_total_liquidity(&10000);
 
         let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
 
@@ -1013,31 +1068,48 @@ mod test {
     #[test]
     #[should_panic(expected = "HostError: Error(Contract, #5)")]
     fn test_mark_liquidated_not_active() {
-        let env = Env::default();
-        env.mock_all_auths();
+        let (env, client, _admin, borrower, lender) = setup_env();
 
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let lender = Address::generate(&env);
         let risk_engine = Address::generate(&env);
         let liquidator = Address::generate(&env);
 
-        let contract_id = env.register(LoanManagement, ());
-        let client = LoanManagementClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
         client.set_risk_engine(&risk_engine);
-        client.update_total_liquidity(&10000);
 
-        let (loan_id, interest_rate) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
+        let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
 
-        // Repay the loan first
-        let interest = (1000 * interest_rate as i128) / 10000;
-        let total_due = 1000 + interest;
-        client.repay_loan(&loan_id, &total_due);
+        // Repay the loan first (no time elapsed, pay full principal)
+        client.repay_loan(&loan_id, &1000);
 
         // Should fail - loan is already repaid
         client.mark_liquidated(&loan_id, &liquidator);
+    }
+
+    #[test]
+    fn test_repay_zero_interest_at_issuance() {
+        let (_env, client, _admin, borrower, lender) = setup_env();
+
+        // No time passes, so no interest. Full principal payment should mark as Repaid.
+        let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &5000, &3600);
+        client.repay_loan(&loan_id, &5000);
+
+        let loan = client.get_loan(&loan_id).unwrap();
+        assert_eq!(loan.status, LoanStatus::Repaid);
+        assert_eq!(loan.principal_repaid, 5000);
+        assert_eq!(loan.interest_repaid, 0);
+    }
+
+    #[test]
+    fn test_overpayment_caps_at_principal() {
+        let (_env, client, _admin, borrower, lender) = setup_env();
+
+        let (loan_id, _) = client.issue_loan(&1, &borrower, &lender, &1000, &3600);
+
+        // Pay way more than needed
+        client.repay_loan(&loan_id, &99999);
+
+        let loan = client.get_loan(&loan_id).unwrap();
+        assert_eq!(loan.status, LoanStatus::Repaid);
+        assert_eq!(loan.principal_repaid, 1000);
     }
 
     #[test]
@@ -1151,10 +1223,8 @@ mod test {
         assert_eq!(total_bor_2, 5000);
         assert_eq!(util_bps_2, 5000); // 50%
 
-        // Repay first loan
-        let loan_1 = client.get_loan(&loan_id_1).unwrap();
-        let interest_1 = (2000 * loan_1.interest_rate as i128) / 10000;
-        client.repay_loan(&loan_id_1, &(2000 + interest_1));
+        // Repay first loan (no time elapsed, pay full principal)
+        client.repay_loan(&loan_id_1, &2000);
 
         let (_, total_bor_3, util_bps_3) = client.get_utilization_stats();
         assert_eq!(total_bor_3, 3000);

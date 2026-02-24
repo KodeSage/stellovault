@@ -1,233 +1,224 @@
-import { NotFoundError, ValidationError } from "../config/errors";
-import { prisma } from "./database.service";
-import websocketService from "./websocket.service";
+import { PrismaClient, Prisma } from "@prisma/client";
+import contractService from "./contract.service";
+import eventMonitoringService from "./event-monitoring.service";
 
-const VALID_VOTE_VALUES = new Set(["FOR", "AGAINST", "ABSTAIN"]);
+const prisma = new PrismaClient();
 
-interface CreateProposalRequest {
-    title?: string;
-    description?: string;
-    type?: string;
-    expiresAt?: string | Date;
+// Governance Status enum (matching schema.prisma)
+export enum GovernanceStatus {
+    OPEN = "OPEN",
+    PASSED = "PASSED",
+    REJECTED = "REJECTED",
+    EXECUTED = "EXECUTED"
 }
 
-interface CastVoteRequest {
-    proposalId?: string;
-    voterId?: string;
-    vote?: string;
-}
-
-interface GovernanceProposal {
-    id: string;
+export interface CreateProposalRequest {
     title: string;
     description: string;
-    type: string;
-    status: string;
-    expiresAt: Date;
-    createdAt: Date;
-    forVotes: number;
-    againstVotes: number;
-    abstainVotes: number;
-    totalVotes: number;
+    proposerId: string;
+    endsAt: Date;
+    contractId?: string;
 }
 
-function parseVote(value: string | undefined, fieldName: string): string {
-    const vote = value?.trim().toUpperCase();
-    if (!vote || !VALID_VOTE_VALUES.has(vote)) {
-        throw new ValidationError(`${fieldName} must be one of: FOR, AGAINST, ABSTAIN`);
-    }
-    return vote;
+export interface CastVoteRequest {
+    proposalId: string;
+    voterAddress: string;
+    vote: string; // "YES" | "NO" | "ABSTAIN"
+    weight: string;
 }
 
-function parseDate(value: string | Date | undefined, fieldName: string): Date {
-    if (!value) {
-        throw new ValidationError(`${fieldName} is required`);
-    }
-
-    const parsed = value instanceof Date ? value : new Date(value);
-    if (Number.isNaN(parsed.getTime())) {
-        throw new ValidationError(`${fieldName} must be a valid date`);
-    }
-    return parsed;
+export interface ProposalFilters {
+    status?: GovernanceStatus;
+    proposerId?: string;
+    limit?: number;
+    offset?: number;
 }
 
 export class GovernanceService {
-    async createProposal(payload: CreateProposalRequest): Promise<{ proposalId: string }> {
-        const title = payload.title?.trim();
-        const description = payload.description?.trim();
-        const type = payload.type?.trim() || "GENERAL";
+    /**
+     * List all proposals with optional filtering and pagination.
+     */
+    async getProposals(filters?: ProposalFilters) {
+        const where: any = {};
         
-        if (!title) {
-            throw new ValidationError("title is required");
+        if (filters?.status) {
+            where.status = filters.status;
         }
-        if (!description) {
-            throw new ValidationError("description is required");
-        }
-
-        const expiresAt = parseDate(payload.expiresAt, "expiresAt");
-        if (expiresAt.getTime() <= Date.now()) {
-            throw new ValidationError("expiresAt must be in the future");
+        if (filters?.proposerId) {
+            where.proposerId = filters.proposerId;
         }
 
-        const db: any = prisma;
-        const proposal = await db.proposal.create({
+        const [proposals, total] = await Promise.all([
+            (prisma as any).governanceProposal.findMany({
+                where,
+                include: {
+                    proposer: {
+                        select: { id: true, stellarAddress: true, name: true }
+                    },
+                    votes: true
+                },
+                skip: filters?.offset,
+                take: filters?.limit ?? 20,
+                orderBy: { createdAt: "desc" }
+            }),
+            (prisma as any).governanceProposal.count({ where })
+        ]);
+
+        return { proposals, total };
+    }
+
+    /**
+     * Create a new governance proposal.
+     */
+    async createProposal(req: CreateProposalRequest) {
+        const proposal = await (prisma as any).governanceProposal.create({
             data: {
-                title,
-                description,
-                type,
-                status: "ACTIVE",
-                expiresAt,
+                title: req.title,
+                description: req.description,
+                proposerId: req.proposerId,
+                endsAt: req.endsAt,
+                status: GovernanceStatus.OPEN
             },
+            include: {
+                proposer: {
+                    select: { id: true, stellarAddress: true, name: true }
+                }
+            }
         });
 
-        return { proposalId: proposal.id };
+        return { proposal };
     }
 
-    async getProposal(proposalId: string): Promise<GovernanceProposal | null> {
-        const db: any = prisma;
-        const proposal = await db.proposal.findUnique({
-            where: { id: proposalId },
+    /**
+     * Get a single proposal by ID.
+     */
+    async getProposalById(id: string) {
+        const proposal = await (prisma as any).governanceProposal.findUnique({
+            where: { id },
             include: {
-                votes: true,
-            },
+                proposer: {
+                    select: { id: true, stellarAddress: true, name: true }
+                },
+                votes: true
+            }
         });
 
         if (!proposal) {
-            return null;
+            throw new Error("Proposal not found");
         }
 
-        const forVotes = proposal.votes.filter((vote: { vote: string }) => vote.vote === "FOR").length;
-        const againstVotes = proposal.votes.filter((vote: { vote: string }) => vote.vote === "AGAINST").length;
-        const abstainVotes = proposal.votes.filter((vote: { vote: string }) => vote.vote === "ABSTAIN").length;
-        const totalVotes = forVotes + againstVotes + abstainVotes;
-
-        return {
-            id: proposal.id,
-            title: proposal.title,
-            description: proposal.description,
-            type: proposal.type,
-            status: proposal.status,
-            expiresAt: proposal.expiresAt,
-            createdAt: proposal.createdAt,
-            forVotes,
-            againstVotes,
-            abstainVotes,
-            totalVotes,
-        };
+        return proposal;
     }
 
-    async listProposals(): Promise<GovernanceProposal[]> {
-        const db: any = prisma;
-        const proposals = await db.proposal.findMany({
-            include: {
-                votes: true,
-            },
-            orderBy: { createdAt: "desc" },
+    /**
+     * Get all votes for a proposal with voter addresses and weights.
+     * Supports pagination to prevent unbounded results.
+     */
+    async getProposalVotes(proposalId: string, options?: { limit?: number; offset?: number }) {
+        const proposal = await (prisma as any).governanceProposal.findUnique({
+            where: { id: proposalId }
         });
 
-        return proposals.map((proposal: any) => {
-            const forVotes = proposal.votes.filter((vote: { vote: string }) => vote.vote === "FOR").length;
-            const againstVotes = proposal.votes.filter((vote: { vote: string }) => vote.vote === "AGAINST").length;
-            const abstainVotes = proposal.votes.filter((vote: { vote: string }) => vote.vote === "ABSTAIN").length;
-            const totalVotes = forVotes + againstVotes + abstainVotes;
-
-            return {
-                id: proposal.id,
-                title: proposal.title,
-                description: proposal.description,
-                type: proposal.type,
-                status: proposal.status,
-                expiresAt: proposal.expiresAt,
-                createdAt: proposal.createdAt,
-                forVotes,
-                againstVotes,
-                abstainVotes,
-                totalVotes,
-            };
-        });
-    }
-
-    async castVote(payload: CastVoteRequest): Promise<void> {
-        const proposalId = payload.proposalId?.trim();
-        const voterId = payload.voterId?.trim();
-        const vote = parseVote(payload.vote, "vote");
-
-        if (!proposalId) {
-            throw new ValidationError("proposalId is required");
-        }
-        if (!voterId) {
-            throw new ValidationError("voterId is required");
-        }
-
-        const db: any = prisma;
-        
-        const proposal = await db.proposal.findUnique({
-            where: { id: proposalId },
-        });
-        
         if (!proposal) {
-            throw new NotFoundError("Proposal not found");
+            throw new Error("Proposal not found");
         }
 
-        if (proposal.status !== "ACTIVE") {
-            throw new ValidationError("Voting is not active for this proposal");
+        const limit = options?.limit ?? 100;
+        const offset = options?.offset ?? 0;
+
+        const [votes, total] = await Promise.all([
+            (prisma as any).governanceVote.findMany({
+                where: { proposalId },
+                orderBy: { createdAt: "desc" },
+                skip: offset,
+                take: limit
+            }),
+            (prisma as any).governanceVote.count({ where: { proposalId } })
+        ]);
+
+        return { votes, total, limit, offset };
+    }
+
+    /**
+     * Submit a vote on a proposal.
+     */
+    async castVote(req: CastVoteRequest) {
+        const proposal = await (prisma as any).governanceProposal.findUnique({
+            where: { id: req.proposalId }
+        });
+
+        if (!proposal) {
+            throw new Error("Proposal not found");
         }
 
-        if (proposal.expiresAt.getTime() <= Date.now()) {
-            throw new ValidationError("Voting period has expired for this proposal");
+        if (proposal.status !== GovernanceStatus.OPEN) {
+            throw new Error(`Cannot vote on proposal with status: ${proposal.status}`);
         }
 
-        const existingVote = await db.vote.findFirst({
+        if (new Date() > proposal.endsAt) {
+            throw new Error("Voting period has ended");
+        }
+
+        // Check for existing vote
+        const existingVote = await (prisma as any).governanceVote.findFirst({
             where: {
-                proposalId,
-                voterId,
-            },
+                proposalId: req.proposalId,
+                voterAddress: req.voterAddress
+            }
         });
 
         if (existingVote) {
-            await db.vote.update({
-                where: { id: existingVote.id },
-                data: { vote },
-            });
-        } else {
-            await db.vote.create({
-                data: {
-                    proposalId,
-                    voterId,
-                    vote,
-                },
-            });
+            throw new Error("User has already voted on this proposal");
         }
 
-        const updatedProposal = await this.getProposal(proposalId);
-        if (updatedProposal) {
-            const newTally = updatedProposal.totalVotes;
-            websocketService.broadcastGovernanceVoteCast(proposalId, newTally);
-        }
-    }
-
-    async getProposalVotes(proposalId: string): Promise<any[]> {
-        const db: any = prisma;
-        return db.vote.findMany({
-            where: { proposalId },
-            orderBy: { createdAt: "desc" },
+        // Create vote
+        const vote = await (prisma as any).governanceVote.create({
+            data: {
+                proposalId: req.proposalId,
+                voterAddress: req.voterAddress,
+                vote: req.vote,
+                weight: new Prisma.Decimal(req.weight)
+            }
         });
+
+        return { vote };
     }
 
-    async getMetrics(): Promise<{ totalProposals: number; participationRate: number }> {
-        const db: any = prisma;
-        
-        const [totalProposals, activeProposals, totalVotes] = await Promise.all([
-            db.proposal.count(),
-            db.proposal.count({ where: { status: "ACTIVE" } }),
-            db.vote.count(),
+    /**
+     * Get protocol governance health metrics.
+     */
+    async getMetrics() {
+        const [totalProposals, openProposals, passedProposals, rejectedProposals, executedProposals, totalVotes] = await Promise.all([
+            (prisma as any).governanceProposal.count(),
+            (prisma as any).governanceProposal.count({ where: { status: GovernanceStatus.OPEN } }),
+            (prisma as any).governanceProposal.count({ where: { status: GovernanceStatus.PASSED } }),
+            (prisma as any).governanceProposal.count({ where: { status: GovernanceStatus.REJECTED } }),
+            (prisma as any).governanceProposal.count({ where: { status: GovernanceStatus.EXECUTED } }),
+            (prisma as any).governanceVote.count()
         ]);
 
+        const avgWeightResult = await (prisma as any).governanceVote.aggregate({
+            _avg: { weight: true }
+        });
+
+        const avgWeight = avgWeightResult._avg.weight ?? new Prisma.Decimal(0);
+
+        // Calculate participation rate (votes per proposal)
         const participationRate = totalProposals > 0 ? totalVotes / totalProposals : 0;
 
         return {
-            totalProposals,
-            participationRate,
+            proposals: {
+                total: totalProposals,
+                open: openProposals,
+                passed: passedProposals,
+                rejected: rejectedProposals,
+                executed: executedProposals
+            },
+            voting: {
+                totalVotes,
+                avgVoteWeight: avgWeight.toString(),
+                participationRate: Number(participationRate.toFixed(2))
+            }
         };
     }
 }
